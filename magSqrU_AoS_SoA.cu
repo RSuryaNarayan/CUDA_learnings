@@ -1,4 +1,4 @@
-// vecadd_bench.cu
+// magSqrU AoS vs. SoA
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
