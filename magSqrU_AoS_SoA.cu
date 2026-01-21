@@ -81,7 +81,8 @@ static float max_abs_err_magSqrU(const float* u, const float* v, const float* w,
 {
     float max_abs = 0.0f;
     for (int i = 0; i < Ncells; i++) {
-        float ref = u[i]*u[i] + v[i]*v[i] + w[i]*w[i];
+        float ref = u[i]*u[i]; 
+                    //+ v[i]*v[i] + w[i]*w[i];
         max_abs = fmaxf(max_abs, fabsf(magSqrU[i] - ref));
     }
     return max_abs;
@@ -258,85 +259,87 @@ int main()
     // Larger N test with timings
     int N_cells = 10000000;
     printf("\nN = %d\n", N_cells);
-    int threads_per_block = 256;
-    int blocks_on_grid = (N_cells + threads_per_block - 1)/threads_per_block;
+    for (int threads_per_block: {64, 128, 256, 512, 1024})
+    {
+        int blocks_on_grid = (N_cells + threads_per_block - 1)/threads_per_block;
 
-    //allocate device side data
-    float* h_u = (float*) std::malloc((size_t)N_cells* sizeof(float));
-    float* h_v = (float*) std::malloc((size_t)N_cells* sizeof(float));
-    float* h_w = (float*) std::malloc((size_t)N_cells* sizeof(float));
-    float* h_U_SoA = (float*) std::malloc((size_t)3*N_cells* sizeof(float));
-    float* h_U_AoS = (float*) std::malloc((size_t)3*N_cells* sizeof(float));
-    float* h_magSqrU_SoA = (float*) std::malloc((size_t)N_cells* sizeof(float));
-    float* h_magSqrU_AoS = (float*) std::malloc((size_t)N_cells* sizeof(float));
-    init_arrays(h_u, h_v, h_w, N_cells);
-    unroll_as_SoA(h_u, h_v, h_w, h_U_SoA, N_cells);
-    unroll_as_AoS(h_u, h_v, h_w, h_U_AoS, N_cells);
+        //allocate device side data
+        float* h_u = (float*) std::malloc((size_t)N_cells* sizeof(float));
+        float* h_v = (float*) std::malloc((size_t)N_cells* sizeof(float));
+        float* h_w = (float*) std::malloc((size_t)N_cells* sizeof(float));
+        float* h_U_SoA = (float*) std::malloc((size_t)3*N_cells* sizeof(float));
+        float* h_U_AoS = (float*) std::malloc((size_t)3*N_cells* sizeof(float));
+        float* h_magSqrU_SoA = (float*) std::malloc((size_t)N_cells* sizeof(float));
+        float* h_magSqrU_AoS = (float*) std::malloc((size_t)N_cells* sizeof(float));
+        init_arrays(h_u, h_v, h_w, N_cells);
+        unroll_as_SoA(h_u, h_v, h_w, h_U_SoA, N_cells);
+        unroll_as_AoS(h_u, h_v, h_w, h_U_AoS, N_cells);
 
-    //allocate device side pointers
-    float *d_U_SoA = nullptr, *d_U_AoS = nullptr, *d_magSqrU_AoS = nullptr, *d_magSqrU_SoA = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_U_SoA, (size_t)3*N_cells*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_U_AoS, (size_t)3*N_cells*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_magSqrU_SoA, (size_t)N_cells*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_magSqrU_AoS, (size_t)N_cells*sizeof(float)));
+        //allocate device side pointers
+        float *d_U_SoA = nullptr, *d_U_AoS = nullptr, *d_magSqrU_AoS = nullptr, *d_magSqrU_SoA = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_U_SoA, (size_t)3*N_cells*sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_U_AoS, (size_t)3*N_cells*sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_magSqrU_SoA, (size_t)N_cells*sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_magSqrU_AoS, (size_t)N_cells*sizeof(float)));
 
-    //memcpys 
-    CUDA_CHECK(cudaMemcpy(d_U_SoA, h_U_SoA, (size_t)3*N_cells*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_U_AoS, h_U_AoS, (size_t)3*N_cells*sizeof(float), cudaMemcpyHostToDevice));
+        //memcpys 
+        CUDA_CHECK(cudaMemcpy(d_U_SoA, h_U_SoA, (size_t)3*N_cells*sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_U_AoS, h_U_AoS, (size_t)3*N_cells*sizeof(float), cudaMemcpyHostToDevice));
 
-    //kernel launches
-    magSqrU_SoA<<<blocks_on_grid, threads_per_block>>>(d_U_SoA, d_magSqrU_SoA, N_cells);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+        //kernel launches
+        magSqrU_SoA<<<blocks_on_grid, threads_per_block>>>(d_U_SoA, d_magSqrU_SoA, N_cells);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-    magSqrU_AoS<<<blocks_on_grid, threads_per_block>>>(d_U_AoS, d_magSqrU_AoS, N_cells);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+        magSqrU_AoS<<<blocks_on_grid, threads_per_block>>>(d_U_AoS, d_magSqrU_AoS, N_cells);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-    //memcpys back
-    CUDA_CHECK(cudaMemcpy(h_magSqrU_SoA, d_magSqrU_SoA, (size_t)N_cells*sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_magSqrU_AoS, d_magSqrU_AoS, (size_t)N_cells*sizeof(float), cudaMemcpyDeviceToHost));
+        //memcpys back
+        CUDA_CHECK(cudaMemcpy(h_magSqrU_SoA, d_magSqrU_SoA, (size_t)N_cells*sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_magSqrU_AoS, d_magSqrU_AoS, (size_t)N_cells*sizeof(float), cudaMemcpyDeviceToHost));
 
-    //error checking
-    float max_err_SoA =0.0f, max_err_AoS =0.0f;
-    max_err_SoA = max_abs_err_magSqrU(h_u, h_v, h_w, h_magSqrU_SoA, N_cells);
-    max_err_AoS = max_abs_err_magSqrU(h_u, h_v, h_w, h_magSqrU_AoS, N_cells);
+        //error checking
+        float max_err_SoA =0.0f, max_err_AoS =0.0f;
+        max_err_SoA = max_abs_err_magSqrU(h_u, h_v, h_w, h_magSqrU_SoA, N_cells);
+        max_err_AoS = max_abs_err_magSqrU(h_u, h_v, h_w, h_magSqrU_AoS, N_cells);
 
-    //timing and bandwidth calculations
-    float avg_kernel_time_SoA=0.0f, avg_kernel_time_AoS=0.0f;
-    int warm_up = 100;
-    int iters = 500;
+        //timing and bandwidth calculations
+        float avg_kernel_time_SoA=0.0f, avg_kernel_time_AoS=0.0f;
+        int warm_up = 100;
+        int iters = 500;
 
-    avg_kernel_time_SoA = time_magSqrU_SoA_ms( d_U_SoA, d_magSqrU_SoA, 
-                            N_cells, blocks_on_grid, threads_per_block,
-                            warm_up, iters);
-    
-    avg_kernel_time_AoS = time_magSqrU_AoS_ms( d_U_AoS, d_magSqrU_AoS, 
-                            N_cells, blocks_on_grid, threads_per_block,
-                            warm_up, iters);
+        avg_kernel_time_SoA = time_magSqrU_SoA_ms( d_U_SoA, d_magSqrU_SoA, 
+                                N_cells, blocks_on_grid, threads_per_block,
+                                warm_up, iters);
+        
+        avg_kernel_time_AoS = time_magSqrU_AoS_ms( d_U_AoS, d_magSqrU_AoS, 
+                                N_cells, blocks_on_grid, threads_per_block,
+                                warm_up, iters);
 
-    const double bytes_per_element = 4 * sizeof(float);
+        const double bytes_per_element = 2 * sizeof(float); // use 4 if using all 3 components 
 
-    double gbytes_per_sec_SoA = (double)N_cells * bytes_per_element / (avg_kernel_time_SoA/1e3) / 1e9;
-    double gbytes_per_sec_AoS = (double)N_cells * bytes_per_element / (avg_kernel_time_AoS/1e3) / 1e9;
+        double gbytes_per_sec_SoA = (double)N_cells * bytes_per_element / (avg_kernel_time_SoA/1e3) / 1e9;
+        double gbytes_per_sec_AoS = (double)N_cells * bytes_per_element / (avg_kernel_time_AoS/1e3) / 1e9;
 
-   printf("\n=====Block size: %d, Num Blocks: %d,======\n", threads_per_block, blocks_on_grid);
-   printf("\nKernel Time: %2.5f ms (SoA), %2.5f ms (AoS)", avg_kernel_time_SoA, avg_kernel_time_AoS);
-   printf("\nMemory Bandwidth: %2.5f GB/s (SoA), %2.5f GB/s (AoS)", gbytes_per_sec_SoA, gbytes_per_sec_AoS);
-   printf("\nmax abs error: %2.5f (SoA), %2.5f (AoS)\n", max_err_SoA, max_err_AoS);
-   
-   //free stuff!
-   CUDA_CHECK(cudaFree(d_U_SoA));
-   CUDA_CHECK(cudaFree(d_U_AoS));
-   CUDA_CHECK(cudaFree(d_magSqrU_SoA));
-   CUDA_CHECK(cudaFree(d_magSqrU_AoS));
-   std::free(h_u);
-   std::free(h_v);
-   std::free(h_w);
-   std::free(h_U_SoA);
-   std::free(h_U_AoS);
-   std::free(h_magSqrU_SoA);
-   std::free(h_magSqrU_AoS);
+        printf("\n=====Block size: %d, Num Blocks: %d,======\n", threads_per_block, blocks_on_grid);
+        printf("\nKernel Time: %2.5f ms (SoA), %2.5f ms (AoS)", avg_kernel_time_SoA, avg_kernel_time_AoS);
+        printf("\nMemory Bandwidth: %2.5f GB/s (SoA), %2.5f GB/s (AoS)", gbytes_per_sec_SoA, gbytes_per_sec_AoS);
+        printf("\nmax abs error: %2.5f (SoA), %2.5f (AoS)\n", max_err_SoA, max_err_AoS);
+        
+        //free stuff!
+        CUDA_CHECK(cudaFree(d_U_SoA));
+        CUDA_CHECK(cudaFree(d_U_AoS));
+        CUDA_CHECK(cudaFree(d_magSqrU_SoA));
+        CUDA_CHECK(cudaFree(d_magSqrU_AoS));
+        std::free(h_u);
+        std::free(h_v);
+        std::free(h_w);
+        std::free(h_U_SoA);
+        std::free(h_U_AoS);
+        std::free(h_magSqrU_SoA);
+        std::free(h_magSqrU_AoS);
+    }
 
    return 0;
 }
