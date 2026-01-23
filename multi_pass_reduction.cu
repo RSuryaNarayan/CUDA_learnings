@@ -113,7 +113,7 @@ __global__ void vec_red_add_block_tree(const float* __restrict__ d_A,
 }
 
 // (4) Two-pass partial reductions. This is just 1 pass kernel
-__global__ void vec_red_add_pass1_partials(const float* __restrict__ d_A,
+__global__ void reduce_pass_partials_serial(const float* __restrict__ d_A,
                                          float* d_sum, // the major difference is 
                                                        // d_sum is now a vector of shape gridDim.x
                                                        // with the partial sums
@@ -275,6 +275,69 @@ static float run_block_tree_once(const float* d_A, float* d_sum, int N, int grid
     return out;
 }
 
+static float reduce_until_one_gpu(const float* d_in, int N,
+                                  int block, int grid_cap,
+                                  float** d_tmpA_out = nullptr,
+                                  float** d_tmpB_out = nullptr)
+{
+    if ((block & (block - 1)) != 0) {
+        fprintf(stderr, "reduce_until_one_gpu: block=%d not power of two\n", block);
+        std::exit(1);
+    }
+    if (N <= 0) {
+        fprintf(stderr, "reduce_until_one_gpu: N must be > 0\n");
+        std::exit(1);
+    }
+
+    // First pass grid (and max temporary size needed)
+    int grid1_needed = (N + block - 1) / block;
+    int grid1 = (grid_cap > 0) ? std::min(grid1_needed, grid_cap) : grid1_needed;
+
+    // Allocate two ping-pong buffers large enough for the biggest partial array (grid1)
+    float* d_bufA = nullptr;
+    float* d_bufB = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_bufA, (size_t)grid1 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_bufB, (size_t)grid1 * sizeof(float)));
+
+    // We’ll alternate reading from src and writing into dst.
+    const float* src = d_in;
+    float* dst = d_bufA;
+
+    int curN = N;
+    size_t shmem = (size_t)block * sizeof(float);
+
+    // Repeat until only 1 value remains
+    while (true) {
+        int grid_needed = (curN + block - 1) / block;
+        int grid = (grid_cap > 0) ? std::min(grid_needed, grid_cap) : grid_needed;
+
+        // Launch: src[0..curN) -> dst[0..grid)
+        reduce_pass_partials_serial<<<grid, block, shmem>>>(src, dst, curN);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // After this pass, we have 'grid' partial sums
+        curN = grid;
+
+        if (curN == 1) {
+            // Final answer is dst[0]
+            float out = 0.0f;
+            CUDA_CHECK(cudaMemcpy(&out, dst, sizeof(float), cudaMemcpyDeviceToHost));
+
+            // Optionally return the temporary buffers to caller (so caller can reuse/free later)
+            if (d_tmpA_out) *d_tmpA_out = d_bufA; else CUDA_CHECK(cudaFree(d_bufA));
+            if (d_tmpB_out) *d_tmpB_out = d_bufB; else CUDA_CHECK(cudaFree(d_bufB));
+            return out;
+        }
+
+        // Swap ping-pong buffers for next pass
+        // Next pass reads from the buffer we just wrote.
+        src = dst;
+        dst = (dst == d_bufA) ? d_bufB : d_bufA;
+    }
+}
+
+
 // --------------------------- Main ---------------------------
 
 int main(int argc, char** argv)
@@ -405,95 +468,25 @@ int main(int argc, char** argv)
   // testing multi-pass reduction (pass1 + pass2+pass3 + pass4 coded manually on GPU)
     {
         int N_small = 10;
-        int block = 2;
-        size_t shmem = (size_t)block * sizeof(float);
-
         float h_A[N_small] = {1.0f, 2.0f, 5.0f, 8.0f, 13.0f, 45.0f, 123.5f, -1.0f, 4.0f, 10.0f};
 
-        // Pass 1 sizing
-        int grid1 = (N_small + block - 1) / block;   // 5 partials
-
-        // host buffers (use vector to avoid VLAs)
-        std::vector<float> h_partial1(grid1, 0.0f);
 
         // device buffers
-        float *d_A = nullptr, *d_partial1 = nullptr;
+        float *d_A = nullptr;
         CUDA_CHECK(cudaMalloc(&d_A, (size_t)N_small * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_partial1, (size_t)grid1 * sizeof(float)));
-
         CUDA_CHECK(cudaMemcpy(d_A, h_A, (size_t)N_small * sizeof(float), cudaMemcpyHostToDevice));
 
-        // Pass 1 launch: A -> partial1
-        vec_red_add_pass1_partials<<<grid1, block, shmem>>>(d_A, d_partial1, N_small);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        // reduce in 1 shot
+        cudaDeviceProp prop{};
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+        int sm = prop.multiProcessorCount;
 
-        CUDA_CHECK(cudaMemcpy(h_partial1.data(), d_partial1, (size_t)grid1 * sizeof(float), cudaMemcpyDeviceToHost));
+        int block = 256;
+        int grid_cap = sm * 8;   // start with 4–8×SM based on your sweep
 
-        printf("\nPass1 partials (grid1=%d):\n", grid1);
-        for (int i = 0; i < grid1; i++) {
-            printf("  partial1[%d]=%2.5f\n", i, h_partial1[i]);
-        }
+        float gpu_sum = reduce_until_one_gpu(d_A, N_small, block, grid_cap);
+        printf("multi-pass GPU sum = %f\n", gpu_sum);
 
-        // Pass 2 sizing: reduce grid1 elements
-        int N2 = grid1;                               // input length for pass2
-        int grid2 = (N2 + block - 1) / block;         // 3 partials
-
-        std::vector<float> h_partial2(grid2, 0.0f);
-        float* d_partial2 = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_partial2, (size_t)grid2 * sizeof(float)));
-
-        // Pass 2 launch: partial1 -> partial2
-        vec_red_add_pass1_partials<<<grid2, block, shmem>>>(d_partial1, d_partial2, N2);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        CUDA_CHECK(cudaMemcpy(h_partial2.data(), d_partial2, (size_t)grid2 * sizeof(float), cudaMemcpyDeviceToHost));
-
-        printf("\nPass2 partials (grid2=%d):\n", grid2);
-        for (int i = 0; i < grid2; i++) {
-            printf("  partial2[%d]=%2.5f\n", i, h_partial2[i]);
-        }
-
-        // Pass 3 sizing: reduce grid2 elements
-        int N3 = grid2;                               // input length for pass2
-        int grid3 = (N3 + block - 1) / block;         // 3 partials
-
-        std::vector<float> h_partial3(grid3, 0.0f);
-        float* d_partial3 = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_partial3, (size_t)grid3 * sizeof(float)));
-
-        // Pass 3 launch: partial2 -> partial3
-        vec_red_add_pass1_partials<<<grid3, block, shmem>>>(d_partial2, d_partial3, N3);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        CUDA_CHECK(cudaMemcpy(h_partial3.data(), d_partial3, (size_t)grid3 * sizeof(float), cudaMemcpyDeviceToHost));
-
-        printf("\nPass3 partials (grid3=%d):\n", grid3);
-        for (int i = 0; i < grid3; i++) {
-            printf("  partial3[%d]=%2.5f\n", i, h_partial3[i]);
-        }
-
-        // Pass 4 sizing: reduce grid3 elements
-        int N4 = grid3;                               // input length for pass2
-        int grid4 = (N4 + block - 1) / block;         // 3 partials
-
-        std::vector<float> h_partial4(grid4, 0.0f);
-        float* d_partial4 = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_partial4, (size_t)grid4 * sizeof(float)));
-
-        // Pass 4 launch: partial3 -> partial4
-        vec_red_add_pass1_partials<<<grid4, block, shmem>>>(d_partial3, d_partial4, N4);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        CUDA_CHECK(cudaMemcpy(h_partial4.data(), d_partial4, (size_t)grid4 * sizeof(float), cudaMemcpyDeviceToHost));
-
-        printf("\nPass3 partials (grid4=%d):\n", grid3);
-        for (int i = 0; i < grid4; i++) {
-            printf("  partial4[%d]=%2.5f\n", i, h_partial4[i]);
-        }
 
         // CPU reference
         double ref = 0.0;
@@ -501,8 +494,6 @@ int main(int argc, char** argv)
         printf("\nCPU ref sum = %2.5f\n", (float)ref);
 
         CUDA_CHECK(cudaFree(d_A));
-        CUDA_CHECK(cudaFree(d_partial1));
-        CUDA_CHECK(cudaFree(d_partial2));
     }
 
 
