@@ -1,5 +1,5 @@
 # CUDA_learnings
-dump of everything I tried while learning CUDA. Tested with MSI A40 GPU. 
+CUDA Microbench experiments to understand GPU Programming basics
 
 MSI module loads:
 ```bash
